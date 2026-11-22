@@ -1,8 +1,14 @@
 // LINE Webhook receiver for the Muse LINE bridge.
 // POST /webhook : verifies X-Line-Signature, queues events into KV, returns 200.
-// GET  /pending : (Bearer POLL_KEY) returns queued events.
-// POST /ack     : (Bearer POLL_KEY) deletes acked events.
+// GET  /pending : (Bearer <redacted>) returns queued events.
+// POST /ack     : (Bearer <redacted>) deletes acked events.
 // Bindings: KV namespace bound as LINE_QUEUE. Secrets: LINE_CHANNEL_SECRET, POLL_KEY.
+//
+// KV free-tier note: list operations are capped at 1,000/day, so /pending must
+// never enumerate keys. Pending event ids are tracked in a single index key
+// ("idx", a JSON array). Polling then costs only reads (100,000/day).
+
+const INDEX_KEY = 'idx';
 
 export default {
   async fetch(request, env) {
@@ -25,23 +31,30 @@ export default {
       }
       const events = Array.isArray(data.events) ? data.events : [];
       const now = Date.now();
+      const ids = [];
       for (let i = 0; i < events.length; i++) {
         const id = `${now}-${i}-${crypto.randomUUID()}`;
         await env.LINE_QUEUE.put(
           `evt:${id}`,
           JSON.stringify({ received_at: new Date().toISOString(), event: events[i] })
         );
+        ids.push(id);
+      }
+      if (ids.length > 0) {
+        const idx = await readIndex(env);
+        idx.push(...ids);
+        await env.LINE_QUEUE.put(INDEX_KEY, JSON.stringify(idx));
       }
       return new Response('ok');
     }
 
     if (request.method === 'GET' && url.pathname === '/pending') {
       if (!authorized(request, env)) return new Response('unauthorized', { status: 401 });
-      const list = await env.LINE_QUEUE.list({ prefix: 'evt:', limit: 100 });
+      const idx = await readIndex(env);
       const items = [];
-      for (const k of list.keys) {
-        const v = await env.LINE_QUEUE.get(k.name);
-        if (v) items.push({ id: k.name.slice(4), payload: JSON.parse(v) });
+      for (const id of idx.slice(0, 100)) {
+        const v = await env.LINE_QUEUE.get(`evt:${id}`);
+        if (v) items.push({ id, payload: JSON.parse(v) });
       }
       return Response.json({ items });
     }
@@ -55,12 +68,28 @@ export default {
         return new Response('bad json', { status: 400 });
       }
       for (const id of ids) await env.LINE_QUEUE.delete(`evt:${id}`);
+      if (ids.length > 0) {
+        const done = new Set(ids);
+        const idx = (await readIndex(env)).filter((id) => !done.has(id));
+        await env.LINE_QUEUE.put(INDEX_KEY, JSON.stringify(idx));
+      }
       return new Response('ok');
     }
 
     return new Response('not found', { status: 404 });
   },
 };
+
+async function readIndex(env) {
+  const raw = await env.LINE_QUEUE.get(INDEX_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 function authorized(request, env) {
   return (request.headers.get('authorization') || '') === `Bearer ${env.POLL_KEY}`;
